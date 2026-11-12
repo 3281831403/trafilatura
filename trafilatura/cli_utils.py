@@ -109,6 +109,42 @@ def load_blacklist(filename: str) -> set[str]:
         return {line.strip() for line in inputfh}
 
 
+def load_url_file(filename: str) -> list[str]:
+    "Read a one-URL-per-line crawl state file, a missing file means an empty list."
+    try:
+        with Path(filename).open(encoding="utf-8-sig") as inputfile:
+            # cut at the first space or tab, the rest is a comment
+            return [url for line in inputfile if (url := line.strip().replace("\t", " ").partition(" ")[0])]
+    except FileNotFoundError:
+        return []
+
+
+def _write_url_file(filename: str, urls: list[str]) -> None:
+    "Write URLs one per line, report I/O errors without crashing."
+    try:
+        with Path(filename).open("w", encoding="utf-8") as outputfile:
+            outputfile.write("".join(f"{url}\n" for url in urls))
+    except OSError as err:
+        LOGGER.error("cannot write %s: %s", filename, err)
+
+
+def write_crawl_files(args: argparse.Namespace, url_store: UrlStore, failed: list[str], todo_in: list[str]) -> None:
+    "Persist the crawl frontier and the fetched URLs to the --todo/--known files."
+    domains = url_store.get_known_domains()
+    todo = [url for domain in domains for url in url_store.find_unvisited_urls(domain)]
+    # failed downloads are retried on the next run
+    todo.extend(failed)
+    # keep queued URLs whose site was not part of this run
+    todo.extend(url for url in todo_in if not url_store.is_known(url))
+    todo = list(dict.fromkeys(todo))
+    if getattr(args, "todo", None):
+        _write_url_file(args.todo, todo)
+    if getattr(args, "known", None):
+        pending = set(todo)
+        known = [url for domain in domains for url in url_store.find_known_urls(domain) if url not in pending]
+        _write_url_file(args.known, known)
+
+
 def load_input_dict(args: argparse.Namespace) -> UrlStore:
     "Read input list of URLs to process and build a domain-aware dictionary."
     inputlist = load_input_urls(args)
@@ -386,15 +422,27 @@ def cli_crawler(
     sleep_time = options.config.getfloat("DEFAULT", "SLEEP_TIME")
     param_dict = {}
     starts = []
+    failed = []
 
     # load input URLs
     spider.URL_STORE = load_input_dict(args) if url_store is None else url_store
+
+    # resume an earlier crawl: queued and already fetched URLs
+    todo = load_url_file(args.todo) if getattr(args, "todo", None) else None
+    known = load_url_file(args.known) if getattr(args, "known", None) else None
 
     # load crawl data
     for hostname in spider.URL_STORE.get_known_domains():
         startpage = spider.URL_STORE.get_url(hostname, as_visited=False)
         if startpage:
-            params = spider.init_crawl(startpage, lang=args.target_language, config=options.config, blacklist=args.blacklist)
+            params = spider.init_crawl(
+                startpage,
+                lang=args.target_language,
+                todo=todo,
+                known=known,
+                config=options.config,
+                blacklist=args.blacklist,
+            )
             # key by the crawl base: it may differ from hostname after a https upgrade,
             # but the store may still hold URLs under the original base
             param_dict[params.base] = params
@@ -402,25 +450,34 @@ def cli_crawler(
             starts.append(params)
 
     # iterate until the threshold is reached
-    while not spider.URL_STORE.done:
-        bufferlist, spider.URL_STORE = load_download_buffer(spider.URL_STORE, sleep_time)
-        for url, result in buffered_response_downloads(bufferlist, args.parallel, options=options):
-            if result and isinstance(result, Response):
-                # not necessarily registered, e.g. after a cross-host homepage redirect
+    try:
+        while not spider.URL_STORE.done:
+            bufferlist, spider.URL_STORE = load_download_buffer(spider.URL_STORE, sleep_time)
+            for url, result in buffered_response_downloads(bufferlist, args.parallel, options=options):
                 crawl_params = param_dict.get(get_base_url(url))
                 if crawl_params is not None:
-                    spider.process_response(result, crawl_params)
+                    crawl_params.tried += 1
+                if result and isinstance(result, Response):
+                    # not necessarily registered, e.g. after a cross-host homepage redirect
+                    if crawl_params is not None:
+                        crawl_params.i += 1
+                        spider.process_response(result, crawl_params)
+                    else:
+                        LOGGER.warning("no crawl parameters for %s", url)
                 else:
-                    LOGGER.warning("no crawl parameters for %s", url)
-        # early exit if maximum count is reached
-        if any(c >= n for c in spider.URL_STORE.get_all_counts()):
-            break
+                    failed.append(url)
+            # early exit if maximum count is reached
+            if any(c >= n for c in spider.URL_STORE.get_all_counts()):
+                break
+    finally:
+        if todo is not None or known is not None:
+            write_crawl_files(args, spider.URL_STORE, failed, todo or [])
 
     print("\n".join(spider.URL_STORE.dump_urls()))
     if not starts:
         return 1
-    # start pages that could not be fetched
-    errors = [p.base for p in starts if p.i == 0]
+    # start pages that could not be fetched although a download was attempted
+    errors = [p.base for p in starts if p.i == 0 and p.tried > 0]
     return _define_exit_code(errors, len(starts))
 
 

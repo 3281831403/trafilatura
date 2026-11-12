@@ -308,6 +308,8 @@ Web crawling
 
 Selecting the ``--crawl`` option automatically looks for pages by following a fixed number of internal links on the website, starting from the given URL and returning a list of links.
 
+An interrupted crawl can be resumed with two state files, one URL per line: ``--todo`` holds the remaining queue and ``--known`` the pages already fetched. Both are read at the start (missing files are fine) and written back in place at the end of the crawl, so re-running the same command with these options does not request the already fetched pages again. Pages whose download failed are put back into the ``--todo`` file and retried on the next run.
+
 See the `page on web crawling <crawls.html>`_ for more information.
 
 

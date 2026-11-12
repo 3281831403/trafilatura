@@ -47,7 +47,20 @@ REFRESH_CONTENT_REGEX = re.compile(r"[^;,]*[;,]\s*(?:url\s*=\s*)?(.*)", re.IGNOR
 class CrawlParameters:
     "Store necessary information to manage a focused crawl."
 
-    __slots__ = ["base", "blacklist", "config", "i", "is_on", "known_num", "lang", "prune_xpath", "ref", "rules", "start"]
+    __slots__ = [
+        "base",
+        "blacklist",
+        "config",
+        "i",
+        "is_on",
+        "known_num",
+        "lang",
+        "prune_xpath",
+        "ref",
+        "rules",
+        "start",
+        "tried",
+    ]
 
     def __init__(
         self,
@@ -65,6 +78,7 @@ class CrawlParameters:
         self.config: ConfigParser = config
         self.rules: RobotFileParser | None = rules or get_rules(self.base, config)
         self.i: int = 0
+        self.tried: int = 0
         self.known_num: int = 0
         self.is_on: bool = True
         self.prune_xpath: str | list[str] | None = prune_xpath
@@ -300,7 +314,15 @@ def init_crawl(
 
     # known links count as visited, except the ones still waiting in the todo list
     pending = set(todo or ())
-    URL_STORE.add_urls(urls=[u for u in known or [] if u not in pending], visited=True)
+    known = [u for u in known or [] if u not in pending]
+    URL_STORE.add_urls(urls=known, visited=True)
+    # add_urls only tags new entries: also flag URLs already in the store, e.g. the start URL
+    if known:
+        known_set = set(known)
+        for domain in URL_STORE.get_known_domains():
+            for url_tuple in URL_STORE.urldict[domain].tuples:
+                if not url_tuple.visited and domain + url_tuple.path() in known_set:
+                    url_tuple.visited = True
     URL_STORE.add_urls(urls=params.filter_list(todo))
     URL_STORE.store_rules(params.base, params.rules)
 
@@ -324,6 +346,7 @@ def crawl_page(
         params.update_metadata(URL_STORE)
         return params
 
+    params.tried += 1  # a download is attempted below
     if initial:
         # probe and process homepage, only count it if it could be fetched
         htmlstring, homepage, new_base_url = probe_alternative_homepage(url, params.config)

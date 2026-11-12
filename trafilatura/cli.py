@@ -14,6 +14,7 @@ from platform import python_version
 
 from .cli_utils import (
     HAS_TQDM,
+    absolute_path,
     check_outputdir_status,
     cli_crawler,
     cli_discovery,
@@ -130,6 +131,16 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=False,
     )
     group3.add_argument(
+        "--todo",
+        help="file with queued URLs (one per line), read before a crawl and updated in place at the end (requires --crawl)",
+        type=str,
+    )
+    group3.add_argument(
+        "--known",
+        help="file with already fetched URLs (one per line), read before a crawl and updated in place at the end (requires --crawl)",
+        type=str,
+    )
+    group3.add_argument(
         "--archived",
         help="try to fetch URLs from the Internet Archive if downloads fail",
         action="store_true",
@@ -222,6 +233,24 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             parser.error(f"{option}: not a file: {filename}")
         if not os.access(filename, os.R_OK):
             parser.error(f"{option}: cannot read {filename}")
+    # crawl state files: read at the start, written back at the end of a crawl
+    if (args.todo or args.known) and not args.crawl:
+        parser.error("--todo and --known require --crawl")
+    for option, filename in (("--todo", args.todo), ("--known", args.known)):
+        if not filename:
+            continue
+        try:
+            mode = Path(filename).stat().st_mode
+        except FileNotFoundError:
+            continue  # created at the end of the crawl
+        except OSError as err:
+            parser.error(f"{option}: {os.strerror(err.errno) if err.errno else err}: {filename}")
+        if not stat.S_ISREG(mode):
+            parser.error(f"{option}: not a file: {filename}")
+        if not os.access(filename, os.R_OK):
+            parser.error(f"{option}: cannot read {filename}")
+    if args.todo and args.known and absolute_path(args.todo) == absolute_path(args.known):
+        parser.error("--todo and --known must be different files")
     # a config file that cannot be parsed would crash mid-run with a traceback
     if args.config_file:
         try:

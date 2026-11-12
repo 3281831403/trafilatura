@@ -1014,6 +1014,82 @@ def test_crawling(capsys, run):
     assert run(["--explore", "https://httpbun.com/html", "--list"])[1].strip() == "https://httpbun.com/html"
 
 
+def test_crawl_resume_with_state_files(tmp_path, run, monkeypatch):
+    "--todo/--known: an interrupted crawl resumes without re-fetching known pages."
+    base = "https://crawl.example.org"
+    pages = {
+        f"{base}/": "<html><body><p>home</p><a href='/a'>a</a> <a href='/b'>b</a></body></html>",
+        f"{base}/a": "<html><body><p>a</p><a href='/c'>c</a></body></html>",
+        f"{base}/b": "<html><body><p>b</p><a href='/d'>d</a></body></html>",
+        f"{base}/c": "<html><body><p>c</p></body></html>",
+        f"{base}/d": "<html><body><p>d</p></body></html>",
+    }
+    requests, budget = [], [2]
+
+    def fake_send(url, no_ssl, config):
+        requests.append(url)
+        page = pages.get(url)
+        if page is None or budget[0] == 0:  # the site rate-limits once the budget is spent
+            return None
+        budget[0] -= 1
+        return Response(page.encode(), 200, url)
+
+    monkeypatch.setattr("trafilatura.downloads._send_urllib_request", fake_send)
+    monkeypatch.setattr("trafilatura.downloads._send_pycurl_request", fake_send)
+
+    def fetched():
+        return [url for url in requests if url in pages]
+
+    todo, known = tmp_path / "todo.txt", tmp_path / "known.txt"
+    seeds = tmp_path / "seeds.txt"
+    seeds.write_text(f"{base}/\n", encoding="utf-8")
+    argv = ["--crawl", "-i", str(seeds), "--todo", str(todo), "--known", str(known), "--parallel", "2"]
+
+    # first segment: interrupted by rate-limiting after the homepage and one page
+    code, _, _ = run(argv)
+    assert code == 0
+    first_known = set(known.read_text(encoding="utf-8").split())
+    first_todo = set(todo.read_text(encoding="utf-8").split())
+    # the homepage and one more page are known, failed downloads are queued again
+    assert first_known == {f"{base}/", fetched()[1]}
+    assert first_todo
+    assert not first_known & first_todo
+    assert set(fetched()) <= first_known | first_todo
+
+    # second segment: the remaining pages are fetched, known pages are not requested again
+    budget[0] = 10
+    requests.clear()
+    code, out, _ = run(argv)
+    assert code == 0
+    assert set(fetched()) == set(pages) - first_known
+    assert set(out.split()) == set(pages)
+    assert set(known.read_text(encoding="utf-8").split()) == set(pages)
+    assert todo.read_text(encoding="utf-8") == ""
+
+    # third segment: nothing left to do, no request and no error
+    requests.clear()
+    code, _, _ = run(argv)
+    assert code == 0
+    assert fetched() == []
+
+
+def test_crawl_state_file_validation(tmp_path, run):
+    "--todo/--known only work with --crawl and must be different usable files."
+    todo = tmp_path / "todo.txt"
+    # the options require --crawl
+    code, _, err = run(["-u", "https://example.org/", "--todo", str(todo)])
+    assert code == 2
+    assert "--todo and --known require --crawl" in err
+    # the two files must differ
+    code, _, err = run(["--crawl", "https://example.org/", "--todo", str(todo), "--known", str(todo)])
+    assert code == 2
+    assert "must be different files" in err
+    # a directory is not a usable state file
+    code, _, err = run(["--crawl", "https://example.org/", "--known", str(tmp_path)])
+    assert code == 2
+    assert "not a file" in err
+
+
 def test_blacklist_discovered_urls(tmp_path, run):
     "The blacklist also applies to the URLs found by feeds, sitemaps and the crawler."
     blacklist = tmp_path / "blacklist.txt"
